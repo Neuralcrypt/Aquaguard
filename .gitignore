@@ -1,0 +1,31 @@
+# Secrets and environments
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.db
+*.sqlite3
+.pytest_cache/
+.ruff_cache/
+# Frontend
+node_modules/
+dist/
+coverage/
+# ML and data
+ml/artifacts/*
+!ml/artifacts/.gitkeep
+*.pkl
+*.joblib
+*.parquet
+*.csv
+!database/seeds/README.md
+# IDE/OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+# Firmware
+.pio/
