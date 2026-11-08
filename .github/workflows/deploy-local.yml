@@ -1,0 +1,121 @@
+
+name: Deploy to local laptop
+
+on:
+  workflow_run:
+    workflows: ["Build and publish containers"]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  deploy:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: [self-hosted, Windows, X64]
+
+    env:
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+      GH_REPOSITORY: ${{ github.repository }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Wait for CI to pass
+        shell: pwsh
+        run: |
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+
+          $uri = "https://api.github.com/repos/$env:GH_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$env:HEAD_SHA&per_page=20"
+          $passed = $false
+
+          for ($attempt = 1; $attempt -le 30; $attempt++) {
+            $response = Invoke-RestMethod -Headers $headers -Uri $uri
+
+            $run = $response.workflow_runs |
+              Where-Object { $_.head_sha -eq $env:HEAD_SHA -and $_.event -eq "push" } |
+              Select-Object -First 1
+
+            if ($run -and $run.status -eq "completed") {
+              if ($run.conclusion -eq "success") {
+                $passed = $true
+                break
+              }
+
+              throw "CI failed. Deployment cancelled."
+            }
+
+            Start-Sleep -Seconds 20
+          }
+
+          if (-not $passed) {
+            throw "Timed out waiting for CI."
+          }
+
+      - name: Deploy AquaGuard
+        shell: pwsh
+        run: |
+          $projectPath = "C:\Users\Abhishek\Desktop\pythonprojects\python-for-ai\Aquaguard"
+          $composeFile = Join-Path $projectPath "compose.ghcr.yaml"
+          $dbContainer = "water-monitoring-system-db-1"
+
+          if (-not (Test-Path $composeFile)) {
+            throw "Local Compose file not found."
+          }
+
+          # Read the existing database password locally.
+          $passwordLine = docker inspect $dbContainer --format '{{range .Config.Env}}{{println .}}{{end}}' |
+            Where-Object { $_ -like "POSTGRES_PASSWORD=*" } |
+            Select-Object -First 1
+
+          if (-not $passwordLine) {
+            throw "Could not read existing database password."
+          }
+
+          $env:POSTGRES_PASSWORD = $passwordLine.Substring("POSTGRES_PASSWORD=".Length)
+
+          # Change only the GHCR image tags to this commit's SHA.
+          $shortSha = $env:HEAD_SHA.Substring(0, 7)
+          $yaml = [System.IO.File]::ReadAllText($composeFile)
+          $yaml = [regex]::Replace($yaml, "sha-[a-f0-9]{7,40}", "sha-$shortSha")
+
+          [System.IO.File]::WriteAllText(
+            $composeFile,
+            $yaml,
+            [System.Text.UTF8Encoding]::new($false)
+          )
+
+          Push-Location $projectPath
+
+          try {
+            docker compose -f compose.ghcr.yaml up -d --pull always
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Docker Compose deployment failed."
+            }
+
+            $health = Invoke-RestMethod "http://localhost:8000/api/health"
+
+            if ($health.status -ne "healthy") {
+              throw "Backend health check failed."
+            }
+
+            $frontend = Invoke-WebRequest "http://localhost:5173" -UseBasicParsing
+
+            if ($frontend.StatusCode -ne 200) {
+              throw "Frontend health check failed."
+            }
+
+            Write-Host "AquaGuard deployment successful for $shortSha."
+          }
+          finally {
+            Pop-Location
+            Remove-Item Env:POSTGRES_PASSWORD -ErrorAction SilentlyContinue
+          }
