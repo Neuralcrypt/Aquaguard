@@ -25,7 +25,7 @@ jobs:
 
     steps:
       - name: Wait for CI to pass
-        shell: pwsh
+        shell: powershell
         run: |
           $headers = @{
             Authorization = "Bearer $env:GH_TOKEN"
@@ -60,7 +60,7 @@ jobs:
           }
 
       - name: Deploy AquaGuard
-        shell: pwsh
+        shell: powershell
         run: |
           $projectPath = "C:\Users\Abhishek\Desktop\pythonprojects\python-for-ai\Aquaguard"
           $composeFile = Join-Path $projectPath "compose.ghcr.yaml"
