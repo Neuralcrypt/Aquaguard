@@ -9,8 +9,8 @@ class Room(Base):
     __tablename__ = "rooms"
     id = Column(String, primary_key=True, default="ROOM-101")
     name = Column(String, nullable=False, default="Room 101")
+    hostel_id = Column(Integer, ForeignKey("hostels.id"), nullable=True, index=True)
     created_at = Column(DateTime, default=utcnow, nullable=False)
-
 class Sensor(Base):
     __tablename__ = "sensors"
     id = Column(String, primary_key=True, default="SENSOR-101")

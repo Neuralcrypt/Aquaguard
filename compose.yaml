@@ -21,6 +21,9 @@ services:
     build: ./backend
     environment:
       DATABASE_URL: postgresql+psycopg://water_app:${POSTGRES_PASSWORD:-local_dev_password_change_me}@db:5432/water_monitoring
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-123456}
+      DEVICE_API_KEY: ${DEVICE_API_KEY}
     ports: ["8000:8000"]
     depends_on:
       db:
