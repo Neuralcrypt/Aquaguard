@@ -29,3 +29,6 @@ ml/artifacts/*
 Thumbs.db
 # Firmware
 .pio/
+
+# Local database backups
+*.dump

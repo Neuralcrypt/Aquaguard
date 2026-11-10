@@ -3,6 +3,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from app.db.session import get_db
+from app.models.auth import User
+from app.core.auth import require_warden
+from app.core.tenant import require_device_key, get_warden_room, get_warden_sensor, get_warden_alert
 from app.models.models import (
     Alert,
     AnomalyResult,
@@ -100,19 +103,19 @@ def _room_payload(room: Room, db: Session):
     }
 
 @router.get("/rooms")
-def list_rooms(db: Session = Depends(get_db)):
-    rooms = db.query(Room).order_by(Room.id.asc()).all()
+def list_rooms(db: Session = Depends(get_db), current_user: User = Depends(require_warden)):
+    rooms = db.query(Room).filter(Room.hostel_id == current_user.hostel_id).order_by(Room.id.asc()).all()
     return [_room_payload(room, db) for room in rooms]
 
 @router.post("/rooms", status_code=201)
-def create_room(payload: RoomCreate, db: Session = Depends(get_db)):
+def create_room(payload: RoomCreate, db: Session = Depends(get_db), current_user: User = Depends(require_warden)):
     room_id = payload.id.strip()
     name = payload.name.strip()
     if not room_id or not name:
         raise HTTPException(status_code=422, detail="Room ID and name are required")
     if db.get(Room, room_id):
         raise HTTPException(status_code=409, detail="A room with this ID already exists")
-    room = Room(id=room_id, name=name)
+    room = Room(id=room_id, name=name, hostel_id=current_user.hostel_id)
     db.add(room)
     for season in SEASONS:
         db.add(SeasonalSetting(room_id=room_id, season=season,
@@ -122,10 +125,8 @@ def create_room(payload: RoomCreate, db: Session = Depends(get_db)):
     return _room_payload(room, db)
 
 @router.patch("/rooms/{room_id}")
-def update_room(room_id: str, payload: RoomUpdate, db: Session = Depends(get_db)):
-    room = db.get(Room, room_id)
-    if not room:
-        raise HTTPException(status_code=404, detail="Room not found")
+def update_room(room_id: str, payload: RoomUpdate, db: Session = Depends(get_db), current_user: User = Depends(require_warden)):
+    room = get_warden_room(db, room_id, current_user)
     name = payload.name.strip()
     if not name:
         raise HTTPException(status_code=422, detail="Room name cannot be empty")
@@ -134,8 +135,8 @@ def update_room(room_id: str, payload: RoomUpdate, db: Session = Depends(get_db)
     return _room_payload(room, db)
 
 @router.delete("/rooms/{room_id}")
-def delete_room(room_id: str, db: Session = Depends(get_db)):
-    room = db.get(Room, room_id)
+def delete_room(room_id: str, db: Session = Depends(get_db), current_user: User = Depends(require_warden)):
+    room = get_warden_room(db, room_id, current_user)
     if room is None:
         raise HTTPException(status_code=404, detail="Room not found")
     if room_id == "ROOM-101":
@@ -162,30 +163,29 @@ def delete_room(room_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/rooms/{room_id}")
-def room_info(room_id: str, db: Session = Depends(get_db)):
-    room = db.get(Room, room_id)
-    if not room:
-        raise HTTPException(status_code=404, detail="Room not found")
+def room_info(room_id: str, db: Session = Depends(get_db), current_user: User = Depends(require_warden)):
+    room = get_warden_room(db, room_id, current_user)
     sensor = db.query(Sensor).filter_by(room_id=room_id).first()
     result = _room_payload(room, db)
     result["calibration_pulses_per_litre"] = sensor.calibration_pulses_per_litre if sensor else None
     return result
 
 @router.get("/overview")
-def overview(db: Session = Depends(get_db)):
+def overview(db: Session = Depends(get_db), current_user: User = Depends(require_warden)):
     now = now_utc_naive()
-    rooms = db.query(Room).all()
+    rooms = db.query(Room).filter(Room.hostel_id == current_user.hostel_id).all()
     payloads = [_room_payload(room, db) for room in rooms]
     return {"room_count": len(rooms),
             "active_sensors": sum(r["sensor_status"] == "Active" for r in payloads),
             "inactive_sensors": sum(r["sensor_status"] == "Inactive" for r in payloads),
             "sensor_issues": sum(r["sensor_status"] == "Issue" for r in payloads),
             "pending_alerts": sum(r["pending_alerts"] for r in payloads),
-            "today_litres": round(float(db.query(func.coalesce(func.sum(WaterReading.interval_volume_litres), 0.0)).filter(WaterReading.timestamp >= now.replace(hour=0, minute=0, second=0, microsecond=0), WaterReading.timestamp < now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)).scalar() or 0), 2)}
+            "today_litres": round(float(db.query(func.coalesce(func.sum(WaterReading.interval_volume_litres), 0.0)).join(Room, WaterReading.room_id == Room.id).filter(Room.hostel_id == current_user.hostel_id, WaterReading.timestamp >= now.replace(hour=0, minute=0, second=0, microsecond=0), WaterReading.timestamp < now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)).scalar() or 0), 2)}
 
 @router.post("/readings", response_model=ReadingOut, status_code=201)
-def create_reading(payload: ReadingCreate, db: Session = Depends(get_db)):
-    if not db.get(Room, payload.room_id):
+def create_reading(payload: ReadingCreate, db: Session = Depends(get_db), device_auth: None = Depends(require_device_key)):
+    room = db.get(Room, payload.room_id)
+    if room is None:
         raise HTTPException(status_code=404, detail="Room not found")
     if not db.query(Sensor).filter_by(id=payload.sensor_id, room_id=payload.room_id, active=True).first():
         raise HTTPException(status_code=404, detail="Active sensor not found for this room")
@@ -203,14 +203,13 @@ def create_reading(payload: ReadingCreate, db: Session = Depends(get_db)):
     return reading
 
 @router.get("/readings", response_model=list[ReadingOut])
-def list_readings(room_id: str = "ROOM-101", limit: int = Query(default=100, ge=1, le=1000), db: Session = Depends(get_db)):
-    if not db.get(Room, room_id): raise HTTPException(status_code=404, detail="Room not found")
+def list_readings(room_id: str = "ROOM-101", limit: int = Query(default=100, ge=1, le=1000), db: Session = Depends(get_db), current_user: User = Depends(require_warden)):
+    get_warden_room(db, room_id, current_user)
     return db.query(WaterReading).filter_by(room_id=room_id).order_by(WaterReading.timestamp.desc()).limit(limit).all()
 
 @router.get("/summary")
-def summary(room_id: str = "ROOM-101", db: Session = Depends(get_db)):
-    if not db.get(Room, room_id):
-        raise HTTPException(status_code=404, detail="Room not found")
+def summary(room_id: str = "ROOM-101", db: Session = Depends(get_db), current_user: User = Depends(require_warden)):
+    get_warden_room(db, room_id, current_user)
 
     now = now_utc_naive()
     today = day_total(db, room_id, now)
@@ -297,12 +296,13 @@ def summary(room_id: str = "ROOM-101", db: Session = Depends(get_db)):
 
 
 @router.get("/settings", response_model=list[SettingOut])
-def get_settings(room_id: str = "ROOM-101", db: Session = Depends(get_db)):
-    if not db.get(Room, room_id): raise HTTPException(status_code=404, detail="Room not found")
+def get_settings(room_id: str = "ROOM-101", db: Session = Depends(get_db), current_user: User = Depends(require_warden)):
+    get_warden_room(db, room_id, current_user)
     return db.query(SeasonalSetting).filter_by(room_id=room_id).all()
 
 @router.put("/settings/{season}", response_model=SettingOut)
-def update_settings(season: str, payload: SettingUpdate, room_id: str = "ROOM-101", db: Session = Depends(get_db)):
+def update_settings(season: str, payload: SettingUpdate, room_id: str = "ROOM-101", db: Session = Depends(get_db), current_user: User = Depends(require_warden)):
+    get_warden_room(db, room_id, current_user)
     if season not in SEASONS: raise HTTPException(status_code=422, detail=f"season must be one of {SEASONS}")
     if not db.get(Room, room_id): raise HTTPException(status_code=404, detail="Room not found")
     setting = db.query(SeasonalSetting).filter_by(room_id=room_id, season=season).first()
@@ -312,43 +312,40 @@ def update_settings(season: str, payload: SettingUpdate, room_id: str = "ROOM-10
     return setting
 
 @router.put("/sensors/{sensor_id}/calibration")
-def update_calibration(sensor_id: str, payload: CalibrationUpdate, db: Session = Depends(get_db)):
-    sensor = db.query(Sensor).filter_by(id=sensor_id).first()
-    if not sensor: raise HTTPException(status_code=404, detail="Sensor not found")
+def update_calibration(sensor_id: str, payload: CalibrationUpdate, db: Session = Depends(get_db), current_user: User = Depends(require_warden)):
+    sensor = get_warden_sensor(db, sensor_id, current_user)
     sensor.calibration_pulses_per_litre = payload.pulses_per_litre
     db.commit()
     return {"sensor_id":sensor_id,"pulses_per_litre":sensor.calibration_pulses_per_litre,"note":"Historical readings were not modified."}
 
 @router.get("/alerts", response_model=list[AlertOut])
-def list_alerts(room_id: str = "ROOM-101", status: str | None = None, db: Session = Depends(get_db)):
-    if not db.get(Room, room_id): raise HTTPException(status_code=404, detail="Room not found")
+def list_alerts(room_id: str = "ROOM-101", status: str | None = None, db: Session = Depends(get_db), current_user: User = Depends(require_warden)):
+    get_warden_room(db, room_id, current_user)
     q = db.query(Alert).filter_by(room_id=room_id)
     if status: q = q.filter_by(status=status)
     return q.order_by(Alert.created_at.desc()).limit(200).all()
 
 @router.patch("/alerts/{alert_id}", response_model=AlertOut)
-def update_alert(alert_id: int, payload: AlertStatusUpdate, db: Session = Depends(get_db)):
+def update_alert(alert_id: int, payload: AlertStatusUpdate, db: Session = Depends(get_db), current_user: User = Depends(require_warden)):
     if payload.status not in ("Pending", "Investigating", "Resolved"):
         raise HTTPException(status_code=422, detail="status must be Pending, Investigating, or Resolved")
-    alert = db.get(Alert, alert_id)
-    if not alert: raise HTTPException(status_code=404, detail="Alert not found")
+    alert = get_warden_alert(db, alert_id, current_user)
     alert.status = payload.status
     alert.resolved_at = now_utc_naive() if payload.status == "Resolved" else None
     db.commit(); db.refresh(alert); return alert
 
 
 @router.delete("/alerts/{alert_id}")
-def delete_alert(alert_id: int, db: Session = Depends(get_db)):
-    alert = db.get(Alert, alert_id)
-    if not alert:
-        raise HTTPException(status_code=404, detail="Alert not found")
+def delete_alert(alert_id: int, db: Session = Depends(get_db), current_user: User = Depends(require_warden)):
+    alert = get_warden_alert(db, alert_id, current_user)
     db.delete(alert)
     db.commit()
     return {"message": f"Alert {alert_id} deleted successfully"}
 
 
 @router.get("/seasonal-analysis")
-def seasonal_analysis(room_id: str = "ROOM-101", db: Session = Depends(get_db)):
+def seasonal_analysis(room_id: str = "ROOM-101", db: Session = Depends(get_db), current_user: User = Depends(require_warden)):
+    get_warden_room(db, room_id, current_user)
     rows = db.query(WaterReading.timestamp, WaterReading.interval_volume_litres).filter_by(room_id=room_id).all()
     totals = {s:0.0 for s in SEASONS}; counts = {s:0 for s in SEASONS}
     for timestamp, litres in rows:
@@ -356,8 +353,8 @@ def seasonal_analysis(room_id: str = "ROOM-101", db: Session = Depends(get_db)):
     return {"room_id":room_id,"note":"Season labels use a prototype month-based policy; validate it with your university calendar.","seasons":[{"season":s,"total_litres":round(totals[s],2),"reading_count":counts[s],"data_available":counts[s]>0} for s in SEASONS]}
 
 @router.post("/anomaly-analysis")
-def anomaly_analysis(room_id: str = "ROOM-101", db: Session = Depends(get_db)):
-    if not db.get(Room, room_id): raise HTTPException(status_code=404, detail="Room not found")
+def anomaly_analysis(room_id: str = "ROOM-101", db: Session = Depends(get_db), current_user: User = Depends(require_warden)):
+    get_warden_room(db, room_id, current_user)
     readings = db.query(WaterReading).filter_by(room_id=room_id).order_by(WaterReading.timestamp.asc()).all()
     if len(readings) < 10:
         return {"status":"insufficient_data","minimum_readings":10,"available_readings":len(readings),"results":[]}
@@ -414,8 +411,9 @@ def ensure_device_stopped(state: DeviceState):
 def update_water_limit(
     payload: WaterLimitUpdate,
     sensor_id: str = "SENSOR-101",
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db), current_user: User = Depends(require_warden)
 ):
+    get_warden_sensor(db, sensor_id, current_user)
     state = get_or_create_device_state(db, sensor_id)
     ensure_device_stopped(state)
 
@@ -435,8 +433,9 @@ def update_water_limit(
 def update_continuous_flow(
     payload: ContinuousFlowConfigUpdate,
     sensor_id: str = "SENSOR-101",
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db), current_user: User = Depends(require_warden)
 ):
+    get_warden_sensor(db, sensor_id, current_user)
     state = get_or_create_device_state(db, sensor_id)
     ensure_device_stopped(state)
 
@@ -456,8 +455,9 @@ def update_continuous_flow(
 def update_low_flow(
     payload: LowFlowConfigUpdate,
     sensor_id: str = "SENSOR-101",
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db), current_user: User = Depends(require_warden)
 ):
+    get_warden_sensor(db, sensor_id, current_user)
     state = get_or_create_device_state(db, sensor_id)
     ensure_device_stopped(state)
 
@@ -480,9 +480,10 @@ def update_low_flow(
 @router.post("/device/control")
 def control_device(
     payload: DeviceControlRequest,
-    db: Session = Depends(get_db)
+    sensor_id: str = "SENSOR-101",
+    db: Session = Depends(get_db), current_user: User = Depends(require_warden)
 ):
-    sensor_id = "SENSOR-101"
+    get_warden_sensor(db, sensor_id, current_user)
     state = get_or_create_device_state(db, sensor_id)
 
     command = payload.command
@@ -523,7 +524,7 @@ def control_device(
 def get_device_command(
     device_id: str = "ESP32-101",
     sensor_id: str = "SENSOR-101",
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db), device_auth: None = Depends(require_device_key)
 ):
     state = get_or_create_device_state(db, sensor_id)
 
@@ -575,9 +576,12 @@ def _add_device_water_reading(
 @router.post("/device/heartbeat")
 def device_heartbeat(
     payload: DeviceHeartbeat,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db), device_auth: None = Depends(require_device_key)
 ):
     state = get_or_create_device_state(db, payload.sensor_id)
+    sensor = db.get(Sensor, payload.sensor_id)
+    if sensor is None:
+        raise HTTPException(status_code=404, detail="Sensor not found")
 
     if state.device_id != payload.device_id:
         raise HTTPException(status_code=404, detail="Device ID mismatch")
@@ -586,10 +590,6 @@ def device_heartbeat(
         raise HTTPException(status_code=400, detail="Invalid command acknowledgment")
 
     now = now_utc_naive()
-    sensor = db.get(Sensor, payload.sensor_id)
-    if not sensor:
-        raise HTTPException(status_code=404, detail="Sensor not found")
-
     previous_running = state.is_running
     previous_low_flow = state.low_flow_detected
     previous_acknowledged_id = state.acknowledged_command_id
@@ -789,8 +789,9 @@ def device_heartbeat(
 @router.get("/device/status")
 def device_status(
     sensor_id: str = "SENSOR-101",
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db), current_user: User = Depends(require_warden)
 ):
+    get_warden_sensor(db, sensor_id, current_user)
     state = get_or_create_device_state(db, sensor_id)
     now = now_utc_naive()
 
