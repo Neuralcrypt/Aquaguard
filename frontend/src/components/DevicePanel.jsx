@@ -22,25 +22,21 @@ export default function DevicePanel({ onNotice }) {
 
   const loadDevice = useCallback(async (forceConfig = false) => {
     try {
-      const [statusResponse, commandResponse] = await Promise.all([
-        api.get('/device/status'),
-        api.get('/device/command', {
-          params: { device_id: 'ESP32-101', sensor_id: 'SENSOR-101' },
-        }),
-      ]);
+      const response = await api.get('/device/status');
+      const device = response.data;
 
-      setStatus(statusResponse.data);
-      const c = commandResponse.data;
+      setStatus(device);
 
       if (forceConfig || !configDirty) {
         setConfig({
-          water_limit_litres: String(c.water_limit_litres ?? 1),
-          continuous_flow_seconds: String(c.continuous_flow_seconds ?? 20),
-          low_flow_threshold_lpm: String(c.low_flow_threshold_lpm ?? 8.5),
-          low_flow_confirmation_seconds: String(c.low_flow_confirmation_seconds ?? 5),
+          water_limit_litres: String(device.water_limit_litres ?? 1),
+          continuous_flow_seconds: String(device.continuous_flow_seconds ?? 20),
+          low_flow_threshold_lpm: String(device.low_flow_threshold_lpm ?? 8.5),
+          low_flow_confirmation_seconds: String(device.low_flow_confirmation_seconds ?? 5),
         });
         setConfigDirty(false);
       }
+
       setPanelError('');
     } catch (error) {
       setPanelError(explainError(error));

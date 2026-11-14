@@ -820,7 +820,9 @@ def device_status(
         "is_running": state.is_running if online and acknowledged else False,
         "flow_rate_lpm": state.last_flow_rate_lpm if online and state.is_running else 0.0,
         "low_flow_threshold_lpm": state.low_flow_threshold_lpm,
+        "low_flow_confirmation_seconds": state.low_flow_confirmation_seconds,
         "water_limit_litres": state.water_limit_litres,
+        "continuous_flow_seconds": state.continuous_flow_seconds,
         "low_flow_detected": (
             state.low_flow_detected
             if online and state.is_running and state.low_flow_threshold_lpm > 0
